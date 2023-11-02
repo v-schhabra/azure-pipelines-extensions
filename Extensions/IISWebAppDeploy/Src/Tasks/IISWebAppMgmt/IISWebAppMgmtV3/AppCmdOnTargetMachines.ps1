@@ -1,40 +1,12 @@
 ﻿Write-Verbose "Entering script AppCmdOnTargetMachines.ps1"
 $AppCmdRegKey = "HKLM:\SOFTWARE\Microsoft\InetStp"
 
-function Run-Command
-{
-    param(
-        [string]$command,
-        [bool] $failOnErr = $true
-    )
-
-    $ErrorActionPreference = 'Continue'
-
-    if( $psversiontable.PSVersion.Major -le 4)
-    {
-        $result = cmd.exe /c "`"$command`""
-    }
-    else
-    {
-        $result = cmd.exe /c "$command"
-    }
-
-    $ErrorActionPreference = 'Stop'
-
-    if($failOnErr -and $LASTEXITCODE -ne 0)
-    {
-        throw $result
-    }
-
-    return $result
-}
-
 function Get-AppCmdLocation
 {
     param(
         [string][Parameter(Mandatory=$true)]$regKeyPath
     )
-
+    
     $appCmdNotFoundError = "Cannot find appcmd.exe location. Verify IIS is configured on $env:ComputerName and try operation again."
     $appCmdMinVersionError = "Version of IIS is less than 7.0 on machine $env:ComputerName. Minimum version of IIS required is 7.0"
     
@@ -71,7 +43,7 @@ function Test-WebsiteExist
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Checking website exists. Running command : $command"
 
-    $website = Run-Command -command $command -failOnErr $false
+    $website = Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs
 
     if($null -ne $website -and $website -like "*`"$siteName`"*")
     {
@@ -99,7 +71,7 @@ function Test-BindingExist
 
     Write-Verbose "Checking binding exists for website (`"$siteName`"). Running command : $command"
 
-    $sites = Run-Command -command $command -failOnErr $false
+    $sites = Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs
 
     $binding = [string]::Format("{0}/{1}:{2}:{3},", $protocol, $ipAddress, $port, $hostname)
 
@@ -135,7 +107,7 @@ function Test-AppPoolExist
 
     Write-Verbose "Checking application pool exists. Running command : $command"
 
-    $appPool = Run-Command -command $command -failOnErr $false
+    $appPool = Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs
 
     $appPoolName = $appPoolName.Replace('`', '``').Replace('"', '`"').Replace('$', '`$')
     if($null -ne $appPool -and $appPool -like "*`"$appPoolName`"*")
@@ -146,36 +118,6 @@ function Test-AppPoolExist
 
     Write-Verbose "Application Pool (`"$appPoolName`") does not exists"
     return $false
-}
-
-function Get-AppPoolState
-{
-    param(
-        [string]$appPoolName
-    )
-
-    $appCmdPath, $iisVersion = Get-AppCmdLocation -regKeyPath $AppCmdRegKey
-    $appCmdArgs = [string]::Format(' list apppool /name:"{0}"',$appPoolName)
-    $command = "`"$appCmdPath`" $appCmdArgs"
-
-    Write-Verbose "Checking application pool state. Running command : $command"
-
-    $appPoolInfo = Run-Command -command $command -failOnErr $false
-
-    $appPoolName = $appPoolName.Replace('`', '``').Replace('"', '`"').Replace('$', '`$')
-    if($null -ne $appPoolInfo -and $appPoolInfo -like "*`"$appPoolName`"*")
-    {
-        $found = $appPoolInfo -match 'state:([A-Z])\w+'
-        if ($found) {
-            $stateInfo = $matches[0]
-            if ($stateInfo) {
-                return ($stateInfo -Split ":")[1]
-            }
-        }
-    }
-
-    Write-Verbose "Application Pool (`"$appPoolName`") does not exists"
-    return $null
 }
 
 function Enable-SNI
@@ -205,7 +147,36 @@ function Enable-SNI
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Enabling SNI by setting SslFlags=1 for binding. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
+}
+
+function ShowCertBinding
+{
+    param(
+        [string]$bindingType,
+        [string]$bindingValue,
+        [string]$port
+    )
+
+    $showCertCmd = "http show sslcert {0}={1}:{2}" -f $bindingType, $bindingValue, $port
+    Write-Verbose "Checking if SslCert binding is already present. Running command : netsh $showCertCmd"
+
+    $netshResult = Invoke-VstsTool -Filename "netsh" -Arguments $showCertCmd
+    $matchingBinding = $netshResult | Where-Object { $_.TrimStart().StartsWith("{0} :" -f $bindingType) -and $_.EndsWith(": {0}:{1}" -f $bindingValue, $port)}
+    return $matchingBinding, $netshResult
+}
+
+function AddCertBinding
+{
+    param(
+        [string]$bindingType,
+        [string]$bindingValue,
+        [string]$port,
+        [string]$certhash
+    )
+
+    $addCertCmd = "http add sslcert {0}={1}:{2} certhash={3} appid={{{4}}} certstorename=MY" -f $bindingType, $bindingValue, $port, $certhash, [System.Guid]::NewGuid().toString()
+    Invoke-VstsTool -Filename "netsh" -Arguments $addCertCmd -RequireExitCodeZero
 }
 
 function Add-SslCert
@@ -230,42 +201,26 @@ function Add-SslCert
         $ipAddress = "0.0.0.0"
     }
 
-    $result = $null
-    $isItSameBinding = $false
-    $addCertCmd = [string]::Empty
+    $isSniEnabled = $sni -eq "true" -and $iisVersion -ge 8 -and -not [string]::IsNullOrWhiteSpace($hostname)
+    $bindingType = if ($isSniEnabled) { "hostnameport" } else { "ipport" }
+    $bindingValue = if ($isSniEnabled) { $hostname } else { $ipAddress }
 
-    #SNI is supported IIS 8 and above. To enable SNI hostnameport option should be used
-    if($sni -eq "true" -and $iisVersion -ge 8 -and -not [string]::IsNullOrWhiteSpace($hostname))
+    $matchingBinding, $netshResult = ShowCertBinding -bindingType $bindingType -bindingValue $bindingValue -port $port
+
+    if($matchingBinding) # A certificate with the same binding is found
     {
-        $showCertCmd = [string]::Format("netsh http show sslcert hostnameport={0}:{1}", $hostname, $port)
-        Write-Verbose "Checking if SslCert binding is already present. Running command : $showCertCmd"
+        $matchingBindingIndex = $netshResult.IndexOf($matchingBinding)
+        $isItSameCert = $netshResult[$matchingBindingIndex + 1].ToLower().Contains($certhash.ToLower()) # The certificate hash is on the next line
 
-        $result = Run-Command -command $showCertCmd -failOnErr $false
-        $isItSameBinding = $result.Get(4).Contains([string]::Format("{0}:{1}", $hostname, $port))
-
-        $addCertCmd = [string]::Format("netsh http add sslcert hostnameport={0}:{1} certhash={2} appid={{{3}}} certstorename=MY", $hostname, $port, $certhash, [System.Guid]::NewGuid().toString())
-    }
-    else
-    {
-        $showCertCmd = [string]::Format("netsh http show sslcert ipport={0}:{1}", $ipAddress, $port)
-        Write-Verbose "Checking if SslCert binding is already present. Running command : $showCertCmd"
-
-        $result = Run-Command -command $showCertCmd -failOnErr $false
-        $isItSameBinding = $result.Get(4).Contains([string]::Format("{0}:{1}", $ipAddress, $port))
-        
-        $addCertCmd = [string]::Format("netsh http add sslcert ipport={0}:{1} certhash={2} appid={{{3}}} certstorename=MY", $ipAddress, $port, $certhash, [System.Guid]::NewGuid().toString())
-    }
-
-    $isItSameCert = $result.Get(5).ToLower().Contains($certhash.ToLower())
-
-    if($isItSameBinding -and $isItSameCert)
-    {
-        Write-Verbose "SSL cert binding is already present. Returning"
-        return
+        if($isItSameCert)
+        {
+            Write-Verbose "SSL cert binding is already present. Returning"
+            return
+        }
     }
 
     Write-Verbose "Setting SslCert for website."
-    Run-Command -command $addCertCmd
+    AddCertBinding -bindingType $bindingType -bindingValue $bindingValue -port $port -certhash $certhash
 }
 
 function Add-Website
@@ -280,7 +235,7 @@ function Add-Website
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Creating website. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Add-AppPool
@@ -294,7 +249,7 @@ function Add-AppPool
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Creating application Pool. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Invoke-AdditionalCommand
@@ -313,7 +268,7 @@ function Invoke-AdditionalCommand
             $command = "`"$appCmdPath`" $appCmdCommand"
 
             Write-Verbose "Running additional command. $command"
-            Run-Command -command $command
+            Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdCommand -RequireExitCodeZero
         }
     }
 }
@@ -341,7 +296,7 @@ function Add-WebsiteBindings {
             $command = "`"$appCmdPath`" $appCmdArgs"
 
             Write-Verbose "Updating website bindings. Running command : $command"
-            Run-Command -command $command
+            Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
         }
 
         if($binding.protocol -eq "https") {
@@ -405,7 +360,7 @@ function Update-Website
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Updating website properties. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Update-AppPool
@@ -440,15 +395,13 @@ function Update-AppPool
         $password = $appPoolCredentials.GetNetworkCredential().password
         
         $appCmdArgs = [string]::Format('{0} -processModel.identityType:SpecificUser', $appCmdArgs)
-        if (-not [string]::IsNullOrWhiteSpace($userName))
-        {
-            $appCmdArgs = [string]::Format('{0} -processModel.userName:"{1}"',$appCmdArgs, $userName)
+        if (-not [string]::IsNullOrWhiteSpace($userName)) {
+            $appCmdArgs = [string]::Format('{0} -processModel.userName:"{1}"',`
+                                $appCmdArgs, $userName)
         }
-        
-        if (-not [string]::IsNullOrWhiteSpace($password))
-        {
-            $appCmdArgsLog = [string]::Format('{0} -processModel.password:"****"',$appCmdArgs)
-            $appCmdArgs = [string]::Format('{0} -processModel.password:"{1}"',$appCmdArgs, $password)
+        if (-not [string]::IsNullOrWhiteSpace($password)) {
+            $appCmdArgs = [string]::Format('{0} -processModel.password:"{1}"',`
+                                $appCmdArgs, $password)
         }
     }
     else
@@ -457,19 +410,10 @@ function Update-AppPool
     }
 
     $appCmdPath, $iisVersion = Get-AppCmdLocation -regKeyPath $AppCmdRegKey
-    
-    if($appCmdArgs -match "processModel.password")
-    {
-        $commandLog = "`"$appCmdPath`" $appCmdArgsLog"
-    }
-    else
-    {
-        $commandLog = "`"$appCmdPath`" $appCmdArgs"
-    }
-	
     $command = "`"$appCmdPath`" $appCmdArgs"
-    Write-Verbose "Updating application pool properties. Running command : $commandLog"
-    Run-Command -command $command
+
+    Write-Verbose "Updating application pool properties. Running command : $command"
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Add-And-Update-Website
@@ -523,7 +467,7 @@ function Test-ApplicationExist {
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Checking application exists. Running command : $command"
 
-    $application = Run-Command -command $command -failOnErr $false
+    $application = Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs 
 
     if($null -ne $application -and $application -like "*`"$applicationName`"*")
     {
@@ -548,7 +492,7 @@ function Add-Application
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Creating web application. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Update-Application 
@@ -604,7 +548,7 @@ function Update-Application
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Updating application properties. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Add-And-Update-Application 
@@ -640,7 +584,7 @@ function Test-VirtualDirectoryExist
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Checking virtual directory exists. Running command : $command"
 
-    $virtualDirectory = Run-Command -command $command -failOnErr $false
+    $virtualDirectory = Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs
 
     if($null -ne $virtualDirectory -and $virtualDirectory -like "*`"$virtualDirectoryName`"*")
     {
@@ -666,7 +610,7 @@ function Add-VirtualDirectory
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Creating virtual directory. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Update-VirtualDirectory 
@@ -716,7 +660,7 @@ function Update-VirtualDirectory
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Updating virtual directory properties. Running command : $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Add-And-Update-VirtualDirectory 
@@ -765,7 +709,7 @@ function Start-Stop-Website {
     $command = "`"$appCmdPath`" $appCmdArgs"
 
     Write-Verbose "Performing action '$action' on website '$sitename'. Running command $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Start-Stop-Recycle-ApplicationPool {
@@ -778,22 +722,8 @@ function Start-Stop-Recycle-ApplicationPool {
     $appCmdArgs = [string]::Format('{0} apppool /apppool.name:"{1}"', $action, $appPoolName)
     $command = "`"$appCmdPath`" $appCmdArgs"
 
-    $appPoolState = Get-AppPoolState -appPoolName $appPoolName
-
-    if ($appPoolState)
-    {
-        if ((($appPoolState -like "Started") -and $action -like "start") -or (($appPoolState -like "Stopped") -and $action -like "stop")) {
-            Write-verbose "Application pool '$appPoolName' is already in state of the action '$action'. Hence skipping the operation."
-            return
-        }
-    } 
-    else
-    {
-        Write-Verbose "Unable to detect the state of application pool '$appPoolName'"
-    } 
-
     Write-Verbose "Performing action '$action' on application pool '$appPoolName'. Running command $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Set-WebsiteAuthentication {
@@ -811,36 +741,19 @@ function Set-WebsiteAuthentication {
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Setting anonymous authentication for website '$websiteName' to $anonymousAuthentication."
     Write-Verbose "Running command $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 
     $appCmdArgs = [string]::Format('set config "{0}" /section:basicAuthentication /enabled:{1} /commit:apphost', $websiteName, $basicAuthentication)
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Setting basic authentication for website '$websiteName' to $basicAuthentication."
     Write-Verbose "Running command $command"
-    Run-Command -command $command
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 
     $appCmdArgs = [string]::Format('set config "{0}" /section:windowsAuthentication /enabled:{1} /commit:apphost', $websiteName, $windowsAuthentication)
     $command = "`"$appCmdPath`" $appCmdArgs"
     Write-Verbose "Setting windows authentication for website '$websiteName' to $windowsAuthentication."
     Write-Verbose "Running command $command"
-    Run-Command -command $command
-}
-
-function Get-PSCredentials {
-
-    param (
-        [string][AllowNull()] $username, 
-        [string][AllowNull()] $password 
-    )
-
-    if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
-        return $null
-    }
-
-    $secretPassword = "$password" | ConvertTo-SecureString -AsPlainText -Force
-    $credentials = New-Object System.Management.Automation.PSCredential ("$username", $secretPassword)
-
-    return $credentials
+    Invoke-VstsTool -Filename $appCmdPath -Arguments $appCmdArgs -RequireExitCodeZero
 }
 
 function Invoke-Main
@@ -857,18 +770,16 @@ function Invoke-Main
         [string]$WebsiteName,
         [string]$PhysicalPath,
         [string]$PhysicalPathAuth,
-        [string]$PhysicalPathAuthUserName,
-        [string]$PhysicalPathAuthUserPassword,
+        [System.Management.Automation.PSCredential] $PhysicalPathAuthCredentials,
         
         [string]$AddBinding,
-        [string]$Bindings,
+        [Object[]]$Bindings,
         
         [string]$AppPoolName,
         [string]$DotNetVersion,
         [string]$PipeLineMode,
         [string]$AppPoolIdentity,
-        [string]$AppPoolUsername,
-        [string]$AppPoolPassword,
+        [System.Management.Automation.PSCredential] $AppPoolCredentials,
 
         [string]$ConfigureAuthentication,
         [string]$AnonymousAuthentication,
@@ -877,14 +788,6 @@ function Invoke-Main
         
         [string]$AppCmdCommands
     )
-
-    $physicalPathAuthCredentials = Get-PSCredentials -username $PhysicalPathAuthUserName -password $PhysicalPathAuthUserPassword
-    $appPoolCredentials = Get-PSCredentials -username $AppPoolUsername -password $AppPoolPassword
-    
-    $bindingsArray = ""
-    if (![string]::IsNullOrWhiteSpace($Bindings)) {
-        $bindingsArray = $Bindings | ConvertFrom-Json
-    }
 
     Write-Verbose "Entering Invoke-Main function"
 
@@ -900,7 +803,6 @@ function Invoke-Main
     Write-Verbose "PhysicalPath = $PhysicalPath"
     Write-Verbose "PhysicalPathAuth = $PhysicalPathAuth"
     Write-Verbose "AddBinding = $AddBinding"
-    Write-Verbose "Bindings = $Bindings"
    
     Write-Verbose "AppPoolName = $AppPoolName"
     Write-Verbose "DotNetVersion = $DotNetVersion"
@@ -918,7 +820,7 @@ function Invoke-Main
     {
         "CreateOrUpdateAppPool"
         {
-            Add-And-Update-AppPool -appPoolName $AppPoolName -clrVersion $DotNetVersion -pipeLineMode $PipeLineMode -identity $AppPoolIdentity -appPoolCredentials $appPoolCredentials 
+            Add-And-Update-AppPool -appPoolName $AppPoolName -clrVersion $DotNetVersion -pipeLineMode $PipeLineMode -identity $AppPoolIdentity -appPoolCredentials $AppPoolCredentials 
         }
 
         "StartAppPool"
@@ -941,11 +843,11 @@ function Invoke-Main
     {
         "CreateOrUpdateWebsite"
         {
-            Add-And-Update-Website -siteName $WebsiteName -appPoolName $AppPoolName -physicalPath $PhysicalPath -authType $PhysicalPathAuth -websitePhysicalPathAuthCredentials $physicalPathAuthCredentials 
+            Add-And-Update-Website -siteName $WebsiteName -appPoolName $AppPoolName -physicalPath $PhysicalPath -authType $PhysicalPathAuth -websitePhysicalPathAuthCredentials $PhysicalPathAuthCredentials 
 
             if($AddBinding -eq "true") 
             {
-                Add-WebsiteBindings -siteName $WebsiteName -bindings $bindingsArray
+                Add-WebsiteBindings -siteName $WebsiteName -bindings $Bindings
             }
 
             if($ConfigureAuthentication -ieq "true")
@@ -967,14 +869,14 @@ function Invoke-Main
 
     if($CreateApplication -eq "true")
     {
-        Add-And-Update-Application -siteName $WebsiteName -virtualPath $VirtualPath -physicalPath $physicalPath -applicationPool $AppPoolName -physicalPathAuthentication $PhysicalPathAuth -physicalPathAuthenticationCredentials $physicalPathAuthCredentials
+        Add-And-Update-Application -siteName $WebsiteName -virtualPath $VirtualPath -physicalPath $physicalPath -applicationPool $AppPoolName -physicalPathAuthentication $PhysicalPathAuth -physicalPathAuthenticationCredentials $PhysicalPathAuthCredentials
     }
 
     if($CreateVirtualDirectory -eq "true")
     {
-        Add-And-Update-VirtualDirectory -siteName $WebsiteName -virtualPath $VirtualPath -physicalPath $physicalPath -physicalPathAuthentication $PhysicalPathAuth -physicalPathAuthenticationCredentials $physicalPathAuthCredentials
+        Add-And-Update-VirtualDirectory -siteName $WebsiteName -virtualPath $VirtualPath -physicalPath $physicalPath -physicalPathAuthentication $PhysicalPathAuth -physicalPathAuthenticationCredentials $PhysicalPathAuthCredentials
     }
 
     Invoke-AdditionalCommand -additionalCommands $AppCmdCommands
-    Write-Verbose "Exiting Invoke-Main function"
+    Write-Verbose "Exiting Execute-Main function"
 }
