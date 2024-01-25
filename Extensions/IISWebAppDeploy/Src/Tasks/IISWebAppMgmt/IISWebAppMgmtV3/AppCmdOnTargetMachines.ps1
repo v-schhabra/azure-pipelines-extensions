@@ -219,7 +219,7 @@ function ShowCertBinding
     $showCertCmd = "netsh http show sslcert {0}={1}:{2}" -f $bindingType, $bindingValue, $port
     Write-Verbose "Checking if SslCert binding is already present. Running command : netsh $showCertCmd"
 
-    $netshResult = Run-Command -command $showCertCmd
+    $netshResult = Run-Command -command $showCertCmd -failOnErr $false
     return $netshResult
 }
 
